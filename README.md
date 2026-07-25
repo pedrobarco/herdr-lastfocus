@@ -61,13 +61,20 @@ prefix+shift+l   = "lastfocus.last-workspace"
   plugin state dir. If a live daemon already holds the lock it exits 0; otherwise
   it clears any stale PID file and spawns a detached (`setsid`) child that
   survives the hook process exiting.
-- On connect the daemon takes a `session.snapshot` and seeds each scope's
-  current id, then subscribes to `pane.focused`, `tab.focused`, and
-  `workspace.focused` and reads events forever.
+- On connect the daemon takes a `session.snapshot` (on its own connection) and
+  seeds each scope's current id, then subscribes to `pane.focused`,
+  `tab.focused`, and `workspace.focused` on a second connection and reads events
+  forever. A snapshot and a subscription must use separate connections: the
+  server closes a connection once it has issued a snapshot.
 - For each event it shifts `current -> previous` and sets the new current **only
-  when that scope's id actually changed**. Focusing a pane emits all three events
-  as a trio, so this dedupe keeps same-tab pane switches from polluting tab or
-  workspace history.
+  when that scope's id actually changed**, so same-tab pane switches never
+  pollute tab or workspace history.
+- A focus change is delivered as a trio in the order `pane_focused` ->
+  `tab_focused` -> `workspace_focused`, and `pane_focused` carries no `tab_id`.
+  The pane event therefore arrives before the tab that owns it is known, so the
+  daemon buffers the pending pane and records it against the tab resolved by the
+  trailing `tab_focused` (falling back to the tracked current tab, or a snapshot
+  lookup by `pane_id`, for a lone pane event).
 - State is persisted as atomic JSON files (write temp + rename) in the state dir:
   - `workspace.json` — workspace scope
   - `tab.<workspace_id>.json` — tab scope, per workspace
@@ -87,8 +94,9 @@ is the sole owner of recording history.
 
 ## Limitations
 
-- `pane.focused` events do not carry a `tab_id`. The daemon tracks the current
-  focused tab (from the `tab.focused` event in the same trio, falling back to a
+- `pane_focused` events do not carry a `tab_id` and arrive before the
+  `tab_focused` in their trio. The daemon defers recording a pane until that
+  `tab_focused` resolves its tab (falling back to the tracked current tab, or a
   snapshot lookup by `pane_id`) to key pane history per tab. In rare races the
   fallback snapshot may be needed.
 - Focusing a pane by id is socket-only; the daemon and actions talk directly to

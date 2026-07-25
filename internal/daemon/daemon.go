@@ -255,40 +255,24 @@ func loop(store *history.Store) error {
 	}
 }
 
-// session opens one connection, seeds scopes from a snapshot, subscribes, and
-// records events until the stream closes.
+// session seeds scopes from a snapshot, then subscribes on a dedicated
+// connection and records events until the stream closes. The snapshot and the
+// subscription must use separate connections: the server does not accept a
+// subscription on a connection that has already issued a snapshot.
 func session(store *history.Store) error {
+	snap, err := herdr.SnapshotOnce()
+	if err != nil {
+		return err
+	}
+
+	rec := newRecorder(store)
+	rec.seed(snap)
+
 	c, err := herdr.DialEnv()
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-
-	snap, err := c.Snapshot()
-	if err != nil {
-		return err
-	}
-
-	// Track the current focused tab id continuously so pane events (which lack
-	// tab_id) can be keyed per tab.
-	currentTab := snap.FocusedTabID
-
-	// Seed each scope's current id (only when unset, preserving history).
-	if snap.FocusedWorkspaceID != "" {
-		if err := store.Seed(history.WorkspaceFile(), snap.FocusedWorkspaceID); err != nil {
-			log.Printf("seed workspace: %v", err)
-		}
-	}
-	if snap.FocusedTabID != "" && snap.FocusedWorkspaceID != "" {
-		if err := store.Seed(history.TabFile(snap.FocusedWorkspaceID), snap.FocusedTabID); err != nil {
-			log.Printf("seed tab: %v", err)
-		}
-	}
-	if snap.FocusedPaneID != "" && currentTab != "" {
-		if err := store.Seed(history.PaneFile(currentTab), snap.FocusedPaneID); err != nil {
-			log.Printf("seed pane: %v", err)
-		}
-	}
 
 	subs := []herdr.Subscription{
 		{Type: "pane.focused"},
@@ -298,62 +282,155 @@ func session(store *history.Store) error {
 	if err := c.Subscribe(subs); err != nil {
 		return err
 	}
-	log.Printf("subscribed; current tab=%s", currentTab)
+	log.Printf("subscribed; current tab=%s", rec.currentTab)
 
 	for {
 		ev, err := c.NextEvent()
 		if err != nil {
 			return err
 		}
-		currentTab = handleEvent(store, ev, currentTab, c)
+		rec.handle(ev)
 	}
 }
 
-// handleEvent applies one focus event and returns the (possibly updated) current
-// tab id. Each scope only shifts current->previous when that scope's id actually
-// changed, so same-tab pane switches never pollute tab/workspace history.
-func handleEvent(store *history.Store, ev *herdr.Event, currentTab string, c *herdr.Client) string {
+// recorder applies focus events to the history store. It exists because the
+// server emits each focus change as a trio in the order pane_focused ->
+// tab_focused -> workspace_focused, and pane_focused carries no tab_id. A pane
+// event therefore arrives before the tab that owns it is known, so the recorder
+// buffers the pending pane and records it once the trailing tab_focused (or a
+// snapshot fallback) resolves its tab.
+type recorder struct {
+	store *history.Store
+
+	// currentTab is the focused tab id, kept current so a lone same-tab pane
+	// switch (a pane event not followed by a new tab_focused) can still be keyed.
+	currentTab string
+
+	// pending holds a pane event awaiting tab resolution.
+	pending        bool
+	pendingPane    string
+	pendingWorkspa string
+}
+
+// newRecorder returns a recorder backed by store.
+func newRecorder(store *history.Store) *recorder {
+	return &recorder{store: store}
+}
+
+// seed initialises tracked state and each scope's current id from a snapshot.
+// It only writes when a scope is unset, preserving history across restarts.
+func (r *recorder) seed(snap *herdr.Snapshot) {
+	r.currentTab = snap.FocusedTabID
+
+	if snap.FocusedWorkspaceID != "" {
+		if err := r.store.Seed(history.WorkspaceFile(), snap.FocusedWorkspaceID); err != nil {
+			log.Printf("seed workspace: %v", err)
+		}
+	}
+	if snap.FocusedTabID != "" && snap.FocusedWorkspaceID != "" {
+		if err := r.store.Seed(history.TabFile(snap.FocusedWorkspaceID), snap.FocusedTabID); err != nil {
+			log.Printf("seed tab: %v", err)
+		}
+	}
+	if snap.FocusedPaneID != "" && snap.FocusedTabID != "" {
+		if err := r.store.Seed(history.PaneFile(snap.FocusedTabID), snap.FocusedPaneID); err != nil {
+			log.Printf("seed pane: %v", err)
+		}
+	}
+}
+
+// handle applies one focus event.
+func (r *recorder) handle(ev *herdr.Event) {
 	d := ev.Data
 	switch ev.Event {
-	case "workspace_focused":
-		if d.WorkspaceID != "" {
-			if _, err := store.Update(history.WorkspaceFile(), d.WorkspaceID); err != nil {
-				log.Printf("update workspace: %v", err)
-			}
+	case "pane_focused":
+		// A new pane event supersedes any still-pending one: flush the previous
+		// via snapshot fallback, then buffer this one until its tab is known.
+		if r.pending {
+			r.flushPending("")
+		}
+		if d.PaneID != "" {
+			r.pending = true
+			r.pendingPane = d.PaneID
+			r.pendingWorkspa = d.WorkspaceID
 		}
 	case "tab_focused":
-		// tab_focused carries tab_id and workspace_id. Update the current tab
-		// tracker first so any pane event in the same trio keys correctly.
+		// tab_focused resolves the tab for a pending pane in the same trio and
+		// updates the tracked current tab.
 		if d.TabID != "" {
-			currentTab = d.TabID
+			r.currentTab = d.TabID
+		}
+		if r.pending {
+			r.flushPending(d.TabID)
 		}
 		if d.TabID != "" && d.WorkspaceID != "" {
-			if _, err := store.Update(history.TabFile(d.WorkspaceID), d.TabID); err != nil {
+			if _, err := r.store.Update(history.TabFile(d.WorkspaceID), d.TabID); err != nil {
 				log.Printf("update tab: %v", err)
 			}
 		}
-	case "pane_focused":
-		// pane_focused lacks tab_id; use the tracked current tab, falling back
-		// to a snapshot lookup by pane_id if the tracker is empty.
-		tab := currentTab
-		if tab == "" && d.PaneID != "" {
-			tab = lookupTabForPane(c, d.PaneID)
-			if tab != "" {
-				currentTab = tab
-			}
+	case "workspace_focused":
+		// A pending pane not followed by a tab event (e.g. a same-tab switch)
+		// is flushed here against the tracked current tab.
+		if r.pending {
+			r.flushPending("")
 		}
-		if d.PaneID != "" && tab != "" {
-			if _, err := store.Update(history.PaneFile(tab), d.PaneID); err != nil {
-				log.Printf("update pane: %v", err)
+		if d.WorkspaceID != "" {
+			if _, err := r.store.Update(history.WorkspaceFile(), d.WorkspaceID); err != nil {
+				log.Printf("update workspace: %v", err)
 			}
 		}
 	}
-	return currentTab
 }
 
-// lookupTabForPane resolves a pane's tab id via a fresh snapshot.
-func lookupTabForPane(c *herdr.Client, paneID string) string {
-	snap, err := c.Snapshot()
+// flushPending records the buffered pane against tabID. When tabID is empty it
+// falls back to the tracked current tab (when its workspace matches), and only
+// as a last resort to a snapshot lookup by pane id.
+func (r *recorder) flushPending(tabID string) {
+	pane := r.pendingPane
+	ws := r.pendingWorkspa
+	r.pending = false
+	r.pendingPane = ""
+	r.pendingWorkspa = ""
+
+	if pane == "" {
+		return
+	}
+
+	tab := tabID
+	if tab == "" {
+		// Use the tracked current tab only if it belongs to the pane's
+		// workspace; otherwise resolve via snapshot to avoid mis-keying.
+		if r.currentTab != "" && (ws == "" || workspaceOfTab(r.currentTab) == ws) {
+			tab = r.currentTab
+		} else {
+			tab = lookupTabForPane(pane)
+			if tab != "" {
+				r.currentTab = tab
+			}
+		}
+	}
+	if tab == "" {
+		return
+	}
+	if _, err := r.store.Update(history.PaneFile(tab), pane); err != nil {
+		log.Printf("update pane: %v", err)
+	}
+}
+
+// workspaceOfTab returns the workspace id prefix of a "ws:tab" id, or "" when
+// the id is not in that form.
+func workspaceOfTab(tabID string) string {
+	for i := 0; i < len(tabID); i++ {
+		if tabID[i] == ':' {
+			return tabID[:i]
+		}
+	}
+	return ""
+}
+
+// lookupTabForPane resolves a pane's tab id via a fresh snapshot connection.
+func lookupTabForPane(paneID string) string {
+	snap, err := herdr.SnapshotOnce()
 	if err != nil {
 		log.Printf("snapshot for pane lookup: %v", err)
 		return ""

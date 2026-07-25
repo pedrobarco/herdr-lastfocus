@@ -69,16 +69,25 @@ func newFakeHerdr(t *testing.T, snapshot map[string]any) *fakeHerdr {
 	return f
 }
 
-// serve accepts a single client and handles its request lines.
+// serve accepts client connections and handles each concurrently. Like the real
+// server, snapshots and subscriptions arrive on separate connections; the
+// connection that subscribes becomes the one events are pushed to.
 func (f *fakeHerdr) serve() {
 	defer f.wg.Done()
-	conn, err := f.ln.Accept()
-	if err != nil {
-		return // listener closed
+	for {
+		conn, err := f.ln.Accept()
+		if err != nil {
+			return // listener closed
+		}
+		f.wg.Add(1)
+		go f.handleConn(conn)
 	}
-	f.mu.Lock()
-	f.conn = conn
-	f.mu.Unlock()
+}
+
+// handleConn processes request lines on a single connection.
+func (f *fakeHerdr) handleConn(conn net.Conn) {
+	defer f.wg.Done()
+	defer conn.Close()
 
 	r := bufio.NewReader(conn)
 	for {
@@ -97,6 +106,10 @@ func (f *fakeHerdr) serve() {
 		case "session.snapshot":
 			f.reply(conn, req.ID, map[string]any{"snapshot": f.snapshot})
 		case "events.subscribe":
+			// This connection receives pushed events.
+			f.mu.Lock()
+			f.conn = conn
+			f.mu.Unlock()
 			f.reply(conn, req.ID, map[string]any{"type": "subscription_started"})
 			select {
 			case f.subscribed <- struct{}{}:
@@ -150,12 +163,13 @@ func (f *fakeHerdr) pushEvent(name string, data map[string]any) {
 	}
 }
 
-// pushPaneTrio emits the workspace/tab/pane trio that herdr sends on a pane
-// focus. pane_focused intentionally omits tab_id.
+// pushPaneTrio emits the trio herdr sends on a pane focus, in the real server
+// order: pane_focused, then tab_focused, then workspace_focused. pane_focused
+// intentionally omits tab_id.
 func (f *fakeHerdr) pushPaneTrio(ws, tab, pane string) {
-	f.pushEvent("workspace_focused", map[string]any{"type": "workspace_focused", "workspace_id": ws})
-	f.pushEvent("tab_focused", map[string]any{"type": "tab_focused", "tab_id": tab, "workspace_id": ws})
 	f.pushEvent("pane_focused", map[string]any{"type": "pane_focused", "pane_id": pane, "workspace_id": ws})
+	f.pushEvent("tab_focused", map[string]any{"type": "tab_focused", "tab_id": tab, "workspace_id": ws})
+	f.pushEvent("workspace_focused", map[string]any{"type": "workspace_focused", "workspace_id": ws})
 }
 
 // closeClient closes the server side of the client connection, ending the

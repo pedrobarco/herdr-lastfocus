@@ -76,24 +76,69 @@ func TestSnapshotDecodes(t *testing.T) {
 }
 
 func TestCallReturnsRPCError(t *testing.T) {
+	// The live server encodes error codes as strings (e.g. "invalid_request");
+	// older/other messages may use a number. Both must decode.
+	cases := []struct {
+		name     string
+		codeJSON string
+		wantCode string
+	}{
+		{"string code", `"invalid_request"`, `"invalid_request"`},
+		{"numeric code", `-1`, `-1`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, server := newPipeClient(t)
+			sr := bufio.NewReader(server)
+
+			go func() {
+				req := readRequest(t, sr)
+				writeLine(t, server, `{"id":"`+req.ID+`","error":{"code":`+tc.codeJSON+`,"message":"boom"}}`)
+			}()
+
+			err := c.Call("some.method", nil, nil)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			var rpcErr *rpcError
+			if !asRPCError(err, &rpcErr) {
+				t.Fatalf("error type = %T, want *rpcError", err)
+			}
+			if string(rpcErr.Code) != tc.wantCode || rpcErr.Message != "boom" {
+				t.Fatalf("rpc error = code=%s message=%s", rpcErr.Code, rpcErr.Message)
+			}
+		})
+	}
+}
+
+func TestCallAlwaysSendsParams(t *testing.T) {
 	c, server := newPipeClient(t)
 	sr := bufio.NewReader(server)
 
+	// Read the raw line so we can assert the params field is present even when
+	// the caller passes nil params.
+	got := make(chan bool, 1)
 	go func() {
-		req := readRequest(t, sr)
-		writeLine(t, server, `{"id":"`+req.ID+`","error":{"code":-1,"message":"boom"}}`)
+		line, err := sr.ReadBytes('\n')
+		if err != nil {
+			got <- false
+			return
+		}
+		var raw map[string]json.RawMessage
+		if json.Unmarshal(line, &raw) != nil {
+			got <- false
+			return
+		}
+		_, ok := raw["params"]
+		writeLine(t, server, `{"id":"1","result":{}}`)
+		got <- ok
 	}()
 
-	err := c.Call("some.method", nil, nil)
-	if err == nil {
-		t.Fatal("expected error")
+	if err := c.Call("some.method", nil, nil); err != nil {
+		t.Fatalf("Call: %v", err)
 	}
-	var rpcErr *rpcError
-	if !asRPCError(err, &rpcErr) {
-		t.Fatalf("error type = %T, want *rpcError", err)
-	}
-	if rpcErr.Code != -1 || rpcErr.Message != "boom" {
-		t.Fatalf("rpc error = %+v", rpcErr)
+	if !<-got {
+		t.Error("request omitted params field")
 	}
 }
 

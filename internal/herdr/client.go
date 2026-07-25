@@ -17,21 +17,28 @@ import (
 // EnvSocketPath is the environment variable that carries the socket path.
 const EnvSocketPath = "HERDR_SOCKET_PATH"
 
-// request is a single JSON-RPC request line.
+// request is a single JSON-RPC request line. Params is always emitted (the
+// server rejects requests with a missing params field), defaulting to an empty
+// object when the caller supplies none.
 type request struct {
 	ID     string      `json:"id"`
 	Method string      `json:"method"`
-	Params interface{} `json:"params,omitempty"`
+	Params interface{} `json:"params"`
 }
 
-// rpcError is the error payload of a failed response.
+// rpcError is the error payload of a failed response. Code is kept raw because
+// the server may encode it as a string (e.g. "invalid_request") or a number.
 type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    json.RawMessage `json:"code"`
+	Message string          `json:"message"`
 }
 
 func (e *rpcError) Error() string {
-	return fmt.Sprintf("herdr rpc error %d: %s", e.Code, e.Message)
+	code := string(e.Code)
+	if len(code) == 0 {
+		return fmt.Sprintf("herdr rpc error: %s", e.Message)
+	}
+	return fmt.Sprintf("herdr rpc error %s: %s", code, e.Message)
 }
 
 // response is a single JSON-RPC response line for a request. The Result is kept
@@ -133,8 +140,12 @@ func (c *Client) nextID() string {
 	return strconv.Itoa(c.seq)
 }
 
-// writeRequest marshals and writes a single request line.
+// writeRequest marshals and writes a single request line. A nil Params is
+// replaced with an empty object so the server always sees a params field.
 func (c *Client) writeRequest(req request) error {
+	if req.Params == nil {
+		req.Params = struct{}{}
+	}
 	b, err := json.Marshal(req)
 	if err != nil {
 		return err
@@ -195,6 +206,19 @@ func (c *Client) Snapshot() (*Snapshot, error) {
 	return &res.Snapshot, nil
 }
 
+// SnapshotOnce dials the socket from the environment, fetches one snapshot, and
+// closes the connection. The server does not accept a subscription on a
+// connection that has already issued a snapshot, so callers that also subscribe
+// must use a dedicated connection for snapshots.
+func SnapshotOnce() (*Snapshot, error) {
+	c, err := DialEnv()
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	return c.Snapshot()
+}
+
 // FocusPane focuses a pane by id (socket-only).
 func (c *Client) FocusPane(paneID string) error {
 	return c.Call("pane.focus", map[string]string{"pane_id": paneID}, nil)
@@ -208,6 +232,40 @@ func (c *Client) FocusTab(tabID string) error {
 // FocusWorkspace focuses a workspace by id.
 func (c *Client) FocusWorkspace(workspaceID string) error {
 	return c.Call("workspace.focus", map[string]string{"workspace_id": workspaceID}, nil)
+}
+
+// FocusPaneOnce dials the socket from the environment, focuses a pane by id, and
+// closes the connection. A dedicated connection is used because the server
+// closes a connection after it has issued a snapshot, so callers must not reuse
+// a snapshot connection for a focus call.
+func FocusPaneOnce(paneID string) error {
+	c, err := DialEnv()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	return c.FocusPane(paneID)
+}
+
+// FocusTabOnce dials the socket, focuses a tab by id, and closes the connection.
+func FocusTabOnce(tabID string) error {
+	c, err := DialEnv()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	return c.FocusTab(tabID)
+}
+
+// FocusWorkspaceOnce dials the socket, focuses a workspace by id, and closes the
+// connection.
+func FocusWorkspaceOnce(workspaceID string) error {
+	c, err := DialEnv()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	return c.FocusWorkspace(workspaceID)
 }
 
 // Subscription describes one event subscription entry.

@@ -29,9 +29,17 @@ func newTestStore(t *testing.T) *history.Store {
 	return s
 }
 
+// trio feeds a focus change in the real server order: pane_focused, then
+// tab_focused, then workspace_focused. pane_focused carries no tab_id.
+func trio(r *recorder, ws, tab, pane string) {
+	r.handle(ev("pane_focused", ws, "", pane))
+	r.handle(ev("tab_focused", ws, tab, ""))
+	r.handle(ev("workspace_focused", ws, "", ""))
+}
+
 // TestSameTabPaneSwitchDoesNotPolluteTabOrWorkspace verifies the trio dedupe:
-// focusing a different pane within the same tab emits all three events, but only
-// the pane scope should record a transition.
+// focusing a different pane within the same tab still emits all three events,
+// but only the pane scope should record a transition.
 func TestSameTabPaneSwitchDoesNotPolluteTabOrWorkspace(t *testing.T) {
 	store := newTestStore(t)
 	const ws, tab = "w1", "w1:t1"
@@ -47,14 +55,12 @@ func TestSameTabPaneSwitchDoesNotPolluteTabOrWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A same-tab pane switch to p2 arrives as a trio.
-	cur := tab
-	cur = handleEvent(store, ev("workspace_focused", ws, "", ""), cur, nil)
-	cur = handleEvent(store, ev("tab_focused", ws, tab, ""), cur, nil)
-	cur = handleEvent(store, ev("pane_focused", ws, "", "w1:p2"), cur, nil)
+	r := newRecorder(store)
+	r.currentTab = tab
+	trio(r, ws, tab, "w1:p2")
 
-	if cur != tab {
-		t.Fatalf("current tab changed to %q, want %q", cur, tab)
+	if r.currentTab != tab {
+		t.Fatalf("current tab changed to %q, want %q", r.currentTab, tab)
 	}
 
 	// Pane scope shifts p1 -> previous, p2 -> current.
@@ -78,6 +84,8 @@ func TestSameTabPaneSwitchDoesNotPolluteTabOrWorkspace(t *testing.T) {
 
 // TestTabSwitchRecordsTabAndPaneButNotWorkspace verifies a cross-tab switch in
 // the same workspace records tab and pane history but leaves workspace alone.
+// The pane event arrives before its tab is known, so the recorder must key it
+// against the trailing tab_focused (tab2), not the previously tracked tab1.
 func TestTabSwitchRecordsTabAndPaneButNotWorkspace(t *testing.T) {
 	store := newTestStore(t)
 	const ws = "w1"
@@ -87,15 +95,12 @@ func TestTabSwitchRecordsTabAndPaneButNotWorkspace(t *testing.T) {
 	store.Seed(history.TabFile(ws), tab1)
 	store.Seed(history.PaneFile(tab1), "w1:p1")
 
-	// Switch to tab2 / pane p3 (trio). tab_focused carries the new tab id, so
-	// the pane event that follows must key against tab2.
-	cur := tab1
-	cur = handleEvent(store, ev("workspace_focused", ws, "", ""), cur, nil)
-	cur = handleEvent(store, ev("tab_focused", ws, tab2, ""), cur, nil)
-	cur = handleEvent(store, ev("pane_focused", ws, "", "w1:p3"), cur, nil)
+	r := newRecorder(store)
+	r.currentTab = tab1
+	trio(r, ws, tab2, "w1:p3")
 
-	if cur != tab2 {
-		t.Fatalf("current tab = %q, want %q", cur, tab2)
+	if r.currentTab != tab2 {
+		t.Fatalf("current tab = %q, want %q", r.currentTab, tab2)
 	}
 
 	tabRec, _ := store.Load(history.TabFile(ws))
@@ -103,12 +108,12 @@ func TestTabSwitchRecordsTabAndPaneButNotWorkspace(t *testing.T) {
 		t.Errorf("tab record = %+v, want current=%s previous=%s", tabRec, tab2, tab1)
 	}
 
-	// Pane history for the new tab is seeded from the trio's pane event.
+	// Pane history for the new tab is keyed to tab2, not the stale tab1.
 	paneRec, _ := store.Load(history.PaneFile(tab2))
 	if paneRec.Current != "w1:p3" {
 		t.Errorf("pane(tab2) current = %q, want w1:p3", paneRec.Current)
 	}
-	// Original tab's pane history is untouched.
+	// Original tab's pane history must not have been polluted.
 	paneRec1, _ := store.Load(history.PaneFile(tab1))
 	if paneRec1.Current != "w1:p1" || paneRec1.Previous != "" {
 		t.Errorf("pane(tab1) polluted: %+v", paneRec1)
@@ -121,36 +126,130 @@ func TestTabSwitchRecordsTabAndPaneButNotWorkspace(t *testing.T) {
 }
 
 // TestWorkspaceSwitchRecordsWorkspace verifies a workspace change records the
-// workspace transition and updates the current tab tracker.
+// workspace transition, keys the pane to the new tab, and updates the tracker.
 func TestWorkspaceSwitchRecordsWorkspace(t *testing.T) {
 	store := newTestStore(t)
 	store.Seed(history.WorkspaceFile(), "w1")
 	store.Seed(history.TabFile("w1"), "w1:t1")
+	store.Seed(history.PaneFile("w1:t1"), "w1:p1")
 
-	cur := "w1:t1"
-	cur = handleEvent(store, ev("workspace_focused", "w2", "", ""), cur, nil)
-	cur = handleEvent(store, ev("tab_focused", "w2", "w2:t1", ""), cur, nil)
-	cur = handleEvent(store, ev("pane_focused", "w2", "", "w2:p1"), cur, nil)
+	r := newRecorder(store)
+	r.currentTab = "w1:t1"
+	trio(r, "w2", "w2:t1", "w2:p1")
 
-	if cur != "w2:t1" {
-		t.Fatalf("current tab = %q, want w2:t1", cur)
+	if r.currentTab != "w2:t1" {
+		t.Fatalf("current tab = %q, want w2:t1", r.currentTab)
 	}
 
 	wsRec, _ := store.Load(history.WorkspaceFile())
 	if wsRec.Current != "w2" || wsRec.Previous != "w1" {
 		t.Errorf("workspace record = %+v, want current=w2 previous=w1", wsRec)
 	}
+
+	// The w2 pane must be keyed to w2:t1, never leaking into w1:t1.
+	pane2, _ := store.Load(history.PaneFile("w2:t1"))
+	if pane2.Current != "w2:p1" {
+		t.Errorf("pane(w2:t1) current = %q, want w2:p1", pane2.Current)
+	}
+	pane1, _ := store.Load(history.PaneFile("w1:t1"))
+	if pane1.Current != "w1:p1" || pane1.Previous != "" {
+		t.Errorf("pane(w1:t1) polluted by cross-workspace switch: %+v", pane1)
+	}
 }
 
-// TestPaneEventWithEmptyDataIgnored ensures malformed/empty events are no-ops.
-func TestPaneEventWithEmptyDataIgnored(t *testing.T) {
+// TestPaneBeforeTabKeysToNewTab is the core regression: because pane_focused
+// arrives before tab_focused, a naive tracker would key the pane to the old tab.
+// The recorder must instead key it to the tab_focused that follows.
+func TestPaneBeforeTabKeysToNewTab(t *testing.T) {
 	store := newTestStore(t)
-	cur := handleEvent(store, ev("pane_focused", "", "", ""), "w1:t1", nil)
-	if cur != "w1:t1" {
-		t.Errorf("current tab changed on empty pane event: %q", cur)
+	r := newRecorder(store)
+	r.currentTab = "w1:t1"
+
+	// Cross-workspace pane event arrives first, then its tab.
+	r.handle(ev("pane_focused", "w3", "", "w3:p1"))
+	// At this point nothing should be written yet (pane is pending).
+	if rec, _ := store.Load(history.PaneFile("w1:t1")); rec.Current != "" {
+		t.Fatalf("pending pane leaked into w1:t1: %+v", rec)
 	}
+	r.handle(ev("tab_focused", "w3", "w3:t1", ""))
+
+	// The pane must land in w3:t1, not w1:t1.
+	if rec, _ := store.Load(history.PaneFile("w3:t1")); rec.Current != "w3:p1" {
+		t.Errorf("pane(w3:t1) = %+v, want current=w3:p1", rec)
+	}
+	if rec, _ := store.Load(history.PaneFile("w1:t1")); rec.Current != "" {
+		t.Errorf("pane leaked into w1:t1: %+v", rec)
+	}
+}
+
+// TestLonePaneSwitchFlushesOnWorkspace verifies that a pane event followed by a
+// workspace event (no intervening tab_focused) is flushed against the tracked
+// current tab.
+func TestLonePaneSwitchFlushesOnWorkspace(t *testing.T) {
+	store := newTestStore(t)
+	store.Seed(history.PaneFile("w1:t1"), "w1:p1")
+
+	r := newRecorder(store)
+	r.currentTab = "w1:t1"
+
+	r.handle(ev("pane_focused", "w1", "", "w1:p2"))
+	r.handle(ev("workspace_focused", "w1", "", ""))
+
+	rec, _ := store.Load(history.PaneFile("w1:t1"))
+	if rec.Current != "w1:p2" || rec.Previous != "w1:p1" {
+		t.Errorf("pane record = %+v, want current=w1:p2 previous=w1:p1", rec)
+	}
+}
+
+// TestConsecutivePaneEventsFlushPrevious verifies that a second pane event
+// flushes the first pending one (via the tracked tab) before buffering itself.
+func TestConsecutivePaneEventsFlushPrevious(t *testing.T) {
+	store := newTestStore(t)
+	r := newRecorder(store)
+	r.currentTab = "w1:t1"
+
+	r.handle(ev("pane_focused", "w1", "", "w1:p1"))
+	r.handle(ev("pane_focused", "w1", "", "w1:p2"))
+	// Resolve the second via its tab.
+	r.handle(ev("tab_focused", "w1", "w1:t1", ""))
+
+	rec, _ := store.Load(history.PaneFile("w1:t1"))
+	if rec.Current != "w1:p2" || rec.Previous != "w1:p1" {
+		t.Errorf("pane record = %+v, want current=w1:p2 previous=w1:p1", rec)
+	}
+}
+
+// TestEmptyPaneEventIgnored ensures empty pane events do not buffer or record.
+func TestEmptyPaneEventIgnored(t *testing.T) {
+	store := newTestStore(t)
+	r := newRecorder(store)
+	r.currentTab = "w1:t1"
+
+	r.handle(ev("pane_focused", "", "", ""))
+	if r.pending {
+		t.Error("empty pane event buffered a pending pane")
+	}
+	r.handle(ev("tab_focused", "w1", "w1:t1", ""))
+
 	rec, _ := store.Load(history.PaneFile("w1:t1"))
 	if rec.Current != "" || rec.Previous != "" || len(rec.Ring) != 0 {
 		t.Errorf("empty pane event recorded: %+v", rec)
+	}
+}
+
+// TestWorkspaceOfTab covers the ws:tab prefix helper.
+func TestWorkspaceOfTab(t *testing.T) {
+	cases := map[string]string{
+		"w1:t1":    "w1",
+		"w12:t3":   "w12",
+		"notabid":  "",
+		":leading": "",
+		"w1:t1:x":  "w1",
+		"":         "",
+	}
+	for in, want := range cases {
+		if got := workspaceOfTab(in); got != want {
+			t.Errorf("workspaceOfTab(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

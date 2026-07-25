@@ -58,20 +58,16 @@ func stateStore() (*history.Store, error) {
 	return history.New(dir)
 }
 
-// lastPane focuses the previously active pane within the current tab.
+// lastPane focuses the previously active pane within the current tab. Reads use
+// a dedicated snapshot connection and the focus call uses a fresh one, because
+// the server closes a connection after a snapshot.
 func lastPane() error {
-	c, err := herdr.DialEnv()
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-
 	// Determine the current focused tab id: prefer the injected env var, else a
 	// live snapshot.
 	tabID := os.Getenv("HERDR_TAB_ID")
 	var focusedPane string
 	if tabID == "" {
-		snap, err := c.Snapshot()
+		snap, err := herdr.SnapshotOnce()
 		if err != nil {
 			return err
 		}
@@ -94,30 +90,24 @@ func lastPane() error {
 		return nil
 	}
 
-	// If we did not learn the live focused pane from a snapshot above, fetch it
-	// so we avoid focusing the pane already focused.
+	// If we did not learn the live focused pane above, fetch it so we avoid
+	// focusing the pane that is already focused.
 	if focusedPane == "" {
-		if snap, err := c.Snapshot(); err == nil {
+		if snap, err := herdr.SnapshotOnce(); err == nil {
 			focusedPane = snap.FocusedPaneID
 		}
 	}
 	if rec.Previous == focusedPane {
 		return nil
 	}
-	return c.FocusPane(rec.Previous)
+	return herdr.FocusPaneOnce(rec.Previous)
 }
 
 // lastTab focuses the previously active tab within the current workspace.
 func lastTab() error {
-	c, err := herdr.DialEnv()
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-
 	wsID := os.Getenv("HERDR_WORKSPACE_ID")
 	if wsID == "" {
-		snap, err := c.Snapshot()
+		snap, err := herdr.SnapshotOnce()
 		if err != nil {
 			return err
 		}
@@ -138,17 +128,11 @@ func lastTab() error {
 	if rec.Previous == "" {
 		return nil
 	}
-	return c.FocusTab(rec.Previous)
+	return herdr.FocusTabOnce(rec.Previous)
 }
 
 // lastWorkspace focuses the previously active workspace.
 func lastWorkspace() error {
-	c, err := herdr.DialEnv()
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-
 	store, err := stateStore()
 	if err != nil {
 		return err
@@ -160,5 +144,5 @@ func lastWorkspace() error {
 	if rec.Previous == "" {
 		return nil
 	}
-	return c.FocusWorkspace(rec.Previous)
+	return herdr.FocusWorkspaceOnce(rec.Previous)
 }
