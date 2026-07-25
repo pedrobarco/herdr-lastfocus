@@ -9,6 +9,11 @@ repos:
       - id: check-merge-conflict
       - id: check-added-large-files
 
+  - repo: https://github.com/golangci/golangci-lint
+    rev: v2.12.2
+    hooks:
+      - id: golangci-lint-full
+
   - repo: local
     hooks:
       - id: gofmt
@@ -39,14 +44,6 @@ repos:
         name: go test
         description: Run the test suite.
         entry: go test ./...
-        language: system
-        pass_filenames: false
-        types: [go]
-
-      - id: golangci-lint
-        name: golangci-lint
-        description: Run golangci-lint.
-        entry: golangci-lint run ./...
         language: system
         pass_filenames: false
         types: [go]
