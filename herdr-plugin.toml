@@ -1,0 +1,27 @@
+id = "lastfocus"
+name = "Last Focus"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "tmux-style last-active pane/tab/workspace toggles via focus-event history"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["go", "build", "-o", "herdr-lastfocus", "."]
+
+[[startup]]
+command = ["./herdr-lastfocus", "daemon", "--ensure"]
+
+[[actions]]
+id = "last-pane"
+title = "Focus last pane"
+command = ["./herdr-lastfocus", "last-pane"]
+
+[[actions]]
+id = "last-tab"
+title = "Focus last tab"
+command = ["./herdr-lastfocus", "last-tab"]
+
+[[actions]]
+id = "last-workspace"
+title = "Focus last workspace"
+command = ["./herdr-lastfocus", "last-workspace"]
