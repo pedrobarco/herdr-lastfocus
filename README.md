@@ -24,6 +24,16 @@ Three actions, each toggling within its scope:
 Invoking an action while sitting on the "current" target sends you to the
 "previous" one; invoking it again returns you — an A↔B toggle.
 
+## Relation to native herdr
+
+herdr ships a native `last_pane` action (unset by default, e.g.
+`last_pane = "prefix+tab"`) that toggles the last-focused pane globally. It has
+no native equivalent for tabs or workspaces — only positional (`next_/previous_`)
+and indexed (`switch_tab`/`switch_workspace = prefix+1..9`) movement. This plugin
+adds per-scope most-recently-used toggles, so its main value is
+`last-tab` and `last-workspace`; use `last-pane` if you prefer per-tab pane
+scoping over herdr's global `last_pane`.
+
 ## Install
 
 Clone the repo, then link or install it with herdr. Both run the build and start
