@@ -1,0 +1,52 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt
+        description: Check Go formatting with gofmt.
+        entry: gofmt
+        language: system
+        args: [-l, -w]
+        types: [go]
+
+      - id: go-vet
+        name: go vet
+        description: Report suspicious constructs with go vet.
+        entry: go vet ./...
+        language: system
+        pass_filenames: false
+        types: [go]
+
+      - id: go-build
+        name: go build
+        description: Ensure the module builds.
+        entry: go build ./...
+        language: system
+        pass_filenames: false
+        types: [go]
+
+      - id: go-test
+        name: go test
+        description: Run the test suite.
+        entry: go test ./...
+        language: system
+        pass_filenames: false
+        types: [go]
+
+      - id: golangci-lint
+        name: golangci-lint
+        description: Run golangci-lint.
+        entry: golangci-lint run ./...
+        language: system
+        pass_filenames: false
+        types: [go]

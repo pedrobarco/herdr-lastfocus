@@ -1,0 +1,30 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # Best-effort cleanup calls whose errors we intentionally ignore.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (*github.com/pedrobarco/herdr-lastfocus/internal/herdr.Client).Close
+        - os.Remove
+        - os.RemoveAll
+        - syscall.Flock
+  exclusions:
+    rules:
+      # Tests use best-effort setup/teardown; unchecked errors there are fine.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
