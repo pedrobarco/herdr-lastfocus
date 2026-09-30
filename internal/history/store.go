@@ -140,6 +140,9 @@ func (s *Store) Update(name, id string) (bool, error) {
 	return true, nil
 }
 
+// Dir returns the base directory of the store.
+func (s *Store) Dir() string { return s.dir }
+
 // pushRing prepends id (most-recent-first), removing an earlier occurrence and
 // capping the length at ringCap.
 func pushRing(ring []string, id string) []string {

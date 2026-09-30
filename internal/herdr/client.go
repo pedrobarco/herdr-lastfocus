@@ -234,6 +234,32 @@ func (c *Client) FocusWorkspace(workspaceID string) error {
 	return c.Call("workspace.focus", map[string]string{"workspace_id": workspaceID}, nil)
 }
 
+// CurrentPane holds the pane id and tab id of the currently focused pane.
+type CurrentPane struct {
+	PaneID string
+	TabID  string
+}
+
+// CurrentPaneOnce dials the socket, fetches the currently focused pane, and
+// closes the connection. It is cheaper than SnapshotOnce for polling use.
+func CurrentPaneOnce() (CurrentPane, error) {
+	c, err := DialEnv()
+	if err != nil {
+		return CurrentPane{}, err
+	}
+	defer c.Close()
+	var result struct {
+		Pane struct {
+			PaneID string `json:"pane_id"`
+			TabID  string `json:"tab_id"`
+		} `json:"pane"`
+	}
+	if err := c.Call("pane.current", nil, &result); err != nil {
+		return CurrentPane{}, err
+	}
+	return CurrentPane{PaneID: result.Pane.PaneID, TabID: result.Pane.TabID}, nil
+}
+
 // FocusPaneOnce dials the socket from the environment, focuses a pane by id, and
 // closes the connection. A dedicated connection is used because the server
 // closes a connection after it has issued a snapshot, so callers must not reuse
