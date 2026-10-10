@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -234,8 +235,11 @@ func loop(store *history.Store) error {
 		}
 
 		if err := session(store); err != nil {
+			var netErr net.Error
 			if errors.Is(err, io.EOF) {
 				log.Printf("stream closed, reconnecting")
+			} else if errors.As(err, &netErr) && netErr.Timeout() {
+				log.Printf("keepalive timeout, reconnecting")
 			} else {
 				log.Printf("session error: %v", err)
 			}
@@ -284,11 +288,32 @@ func session(store *history.Store) error {
 	}
 	log.Printf("subscribed; current tab=%s", rec.currentTab)
 
+	// pollInterval drives pane.current polling to catch keyboard-driven focus
+	// changes that herdr does not publish as events. keepalive forces a reconnect
+	// after a long period of silence to guard against silent subscription drops.
+	const (
+		pollInterval = time.Second
+		keepalive    = 30 * time.Minute
+	)
+	lastEvent := time.Now()
 	for {
-		ev, err := c.NextEvent()
-		if err != nil {
+		if err := c.SetReadDeadline(time.Now().Add(pollInterval)); err != nil {
 			return err
 		}
+		ev, err := c.NextEvent()
+		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				rec.pollCurrentPane()
+				if time.Since(lastEvent) > keepalive {
+					log.Printf("keepalive timeout, reconnecting")
+					return nil
+				}
+				continue
+			}
+			return err
+		}
+		lastEvent = time.Now()
 		rec.handle(ev)
 	}
 }
@@ -299,6 +324,10 @@ func session(store *history.Store) error {
 // event therefore arrives before the tab that owns it is known, so the recorder
 // buffers the pending pane and records it once the trailing tab_focused (or a
 // snapshot fallback) resolves its tab.
+//
+// herdr 0.9.0 does not fire focus events for user keyboard navigation (only for
+// programmatic pane.focus RPC calls). The recorder therefore also polls
+// pane.current every second to catch keyboard-driven pane changes.
 type recorder struct {
 	store *history.Store
 
@@ -310,6 +339,11 @@ type recorder struct {
 	pending        bool
 	pendingPane    string
 	pendingWorkspa string
+
+	// lastPolledPane and lastPolledTab track the pane seen by the most recent
+	// poll call, so consecutive polls for the same pane are no-ops.
+	lastPolledPane string
+	lastPolledTab  string
 }
 
 // newRecorder returns a recorder backed by store.
@@ -344,8 +378,12 @@ func (r *recorder) handle(ev *herdr.Event) {
 	d := ev.Data
 	switch ev.Event {
 	case "pane_focused":
-		// A new pane event supersedes any still-pending one: flush the previous
-		// via snapshot fallback, then buffer this one until its tab is known.
+		// A new pane event supersedes any still-pending one. Flush the pending
+		// pane now: mouse-only focus events fire a single pane_focused without a
+		// trailing workspace_focused, so they would never reach the store if we
+		// discarded here. The ring-walk in lastPane uses a live snapshot for the
+		// current pane, so extra entries (return-to-source events, pre-action
+		// events) are harmless — they just get skipped in the walk.
 		if r.pending {
 			r.flushPending("")
 		}
@@ -355,13 +393,13 @@ func (r *recorder) handle(ev *herdr.Event) {
 			r.pendingWorkspa = d.WorkspaceID
 		}
 	case "tab_focused":
-		// tab_focused resolves the tab for a pending pane in the same trio and
-		// updates the tracked current tab.
+		// tab_focused updates the tracked current tab and the tab history.
+		// It does NOT flush any pending pane: in all observed event orderings
+		// (0.7.5: pane→tab→workspace; 0.9.0: tab→pane→workspace) workspace_focused
+		// is always the last event in the trio, so flushing there is sufficient
+		// and avoids recording intermediate pane events that arrive before tab_focused.
 		if d.TabID != "" {
 			r.currentTab = d.TabID
-		}
-		if r.pending {
-			r.flushPending(d.TabID)
 		}
 		if d.TabID != "" && d.WorkspaceID != "" {
 			if _, err := r.store.Update(history.TabFile(d.WorkspaceID), d.TabID); err != nil {
@@ -426,6 +464,31 @@ func workspaceOfTab(tabID string) string {
 		}
 	}
 	return ""
+}
+
+// pollCurrentPane queries pane.current and records the pane if it differs from
+// the last polled pane. This catches keyboard-driven focus changes that herdr
+// does not publish as subscription events.
+func (r *recorder) pollCurrentPane() {
+	cp, err := herdr.CurrentPaneOnce()
+	if err != nil {
+		log.Printf("poll current pane: %v", err)
+		return
+	}
+	if cp.PaneID == "" || cp.TabID == "" {
+		return
+	}
+	if cp.PaneID == r.lastPolledPane {
+		return
+	}
+	r.lastPolledPane = cp.PaneID
+	r.lastPolledTab = cp.TabID
+	if cp.TabID != r.currentTab {
+		r.currentTab = cp.TabID
+	}
+	if _, err := r.store.Update(history.PaneFile(cp.TabID), cp.PaneID); err != nil {
+		log.Printf("update poll pane: %v", err)
+	}
 }
 
 // lookupTabForPane resolves a pane's tab id via a fresh snapshot connection.
