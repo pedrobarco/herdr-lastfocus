@@ -22,8 +22,9 @@ type fakeHerdr struct {
 	path     string
 	snapshot map[string]any
 
-	mu   sync.Mutex
-	conn net.Conn // the active client connection (for pushing events)
+	mu      sync.Mutex
+	conn    net.Conn       // the active client connection (for pushing events)
+	current map[string]any // pane returned by pane.current; nil answers empty
 
 	subscribed chan struct{} // closed-style signal via send when subscribe seen
 	wg         sync.WaitGroup
@@ -115,6 +116,11 @@ func (f *fakeHerdr) handleConn(conn net.Conn) {
 			case f.subscribed <- struct{}{}:
 			default:
 			}
+		case "pane.current":
+			f.mu.Lock()
+			cur := f.current
+			f.mu.Unlock()
+			f.reply(conn, req.ID, map[string]any{"pane": cur})
 		default:
 			// Focus calls and anything else: acknowledge with an empty result.
 			f.reply(conn, req.ID, map[string]any{})
@@ -170,6 +176,14 @@ func (f *fakeHerdr) pushPaneTrio(ws, tab, pane string) {
 	f.pushEvent("pane_focused", map[string]any{"type": "pane_focused", "pane_id": pane, "workspace_id": ws})
 	f.pushEvent("tab_focused", map[string]any{"type": "tab_focused", "tab_id": tab, "workspace_id": ws})
 	f.pushEvent("workspace_focused", map[string]any{"type": "workspace_focused", "workspace_id": ws})
+}
+
+// setCurrent sets the pane that pane.current reports, which simulates a
+// keyboard focus change that herdr does not publish as an event.
+func (f *fakeHerdr) setCurrent(ws, tab, pane string) {
+	f.mu.Lock()
+	f.current = map[string]any{"pane_id": pane, "tab_id": tab, "workspace_id": ws}
+	f.mu.Unlock()
 }
 
 // closeClient closes the server side of the client connection, ending the
@@ -397,4 +411,38 @@ func shortStateDir(t *testing.T) string {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	return dir
+}
+
+// TestPollRecordsKeyboardTabSwitches verifies that the pane.current poll
+// records tab and workspace history, because herdr 0.9.0 fires no focus
+// events for keyboard navigation. Without this, last-tab only ever sees its
+// own jumps and toggles one fixed pair of tabs.
+func TestPollRecordsKeyboardTabSwitches(t *testing.T) {
+	f := newFakeHerdr(t, map[string]any{})
+	t.Setenv("HERDR_SOCKET_PATH", f.path)
+
+	store, err := history.New(shortStateDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := newRecorder(store)
+
+	for _, step := range []struct{ ws, tab, pane string }{
+		{"w1", "w1:t1", "w1:p1"},
+		{"w1", "w1:t2", "w1:p2"},
+		{"w1", "w1:t3", "w1:p3"},
+		{"w2", "w2:t1", "w2:p1"},
+	} {
+		f.setCurrent(step.ws, step.tab, step.pane)
+		r.pollCurrentPane()
+	}
+
+	tab, _ := store.Load(history.TabFile("w1"))
+	if tab.Current != "w1:t3" || tab.Previous != "w1:t2" {
+		t.Errorf("w1 tab record = %+v, want current=w1:t3 previous=w1:t2", tab)
+	}
+	ws, _ := store.Load(history.WorkspaceFile())
+	if ws.Current != "w2" || ws.Previous != "w1" {
+		t.Errorf("workspace record = %+v, want current=w2 previous=w1", ws)
+	}
 }

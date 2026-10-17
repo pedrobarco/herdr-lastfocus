@@ -57,7 +57,6 @@ func saveTogglePair(dir, tabID, a, b string) {
 	os.Rename(name, dst)
 }
 
-
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -173,13 +172,16 @@ func lastPane() error {
 }
 
 // lastTab focuses the previously active tab within the current workspace.
+// It walks the history ring most-recent-first against a live snapshot, so a
+// keyboard switch that the 1s daemon poll has not recorded yet still resolves
+// to the tab the user just left, and closed tabs are skipped.
 func lastTab() error {
+	snap, err := herdr.SnapshotOnce()
+	if err != nil {
+		return err
+	}
 	wsID := os.Getenv("HERDR_WORKSPACE_ID")
 	if wsID == "" {
-		snap, err := herdr.SnapshotOnce()
-		if err != nil {
-			return err
-		}
 		wsID = snap.FocusedWorkspaceID
 	}
 	if wsID == "" {
@@ -194,10 +196,19 @@ func lastTab() error {
 	if err != nil {
 		return err
 	}
-	if rec.Previous == "" {
-		return nil
+
+	liveTabs := make(map[string]bool, len(snap.Tabs))
+	for _, t := range snap.Tabs {
+		if t.WorkspaceID == wsID {
+			liveTabs[t.TabID] = true
+		}
 	}
-	return herdr.FocusTabOnce(rec.Previous)
+	for _, id := range rec.Ring {
+		if id != snap.FocusedTabID && liveTabs[id] {
+			return herdr.FocusTabOnce(id)
+		}
+	}
+	return nil
 }
 
 // lastWorkspace focuses the previously active workspace.

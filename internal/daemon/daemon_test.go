@@ -159,19 +159,21 @@ func TestWorkspaceSwitchRecordsWorkspace(t *testing.T) {
 
 // TestPaneBeforeTabKeysToNewTab is the core regression: because pane_focused
 // arrives before tab_focused, a naive tracker would key the pane to the old tab.
-// The recorder must instead key it to the tab_focused that follows.
+// The recorder must instead key it to the tab_focused that follows. The pane
+// stays pending until workspace_focused, which always ends the trio.
 func TestPaneBeforeTabKeysToNewTab(t *testing.T) {
 	store := newTestStore(t)
 	r := newRecorder(store)
 	r.currentTab = "w1:t1"
 
-	// Cross-workspace pane event arrives first, then its tab.
+	// Cross-workspace pane event arrives first, then its tab and workspace.
 	r.handle(ev("pane_focused", "w3", "", "w3:p1"))
 	// At this point nothing should be written yet (pane is pending).
 	if rec, _ := store.Load(history.PaneFile("w1:t1")); rec.Current != "" {
 		t.Fatalf("pending pane leaked into w1:t1: %+v", rec)
 	}
 	r.handle(ev("tab_focused", "w3", "w3:t1", ""))
+	r.handle(ev("workspace_focused", "w3", "", ""))
 
 	// The pane must land in w3:t1, not w1:t1.
 	if rec, _ := store.Load(history.PaneFile("w3:t1")); rec.Current != "w3:p1" {
@@ -210,8 +212,9 @@ func TestConsecutivePaneEventsFlushPrevious(t *testing.T) {
 
 	r.handle(ev("pane_focused", "w1", "", "w1:p1"))
 	r.handle(ev("pane_focused", "w1", "", "w1:p2"))
-	// Resolve the second via its tab.
+	// The second stays pending until workspace_focused ends the trio.
 	r.handle(ev("tab_focused", "w1", "w1:t1", ""))
+	r.handle(ev("workspace_focused", "w1", "", ""))
 
 	rec, _ := store.Load(history.PaneFile("w1:t1"))
 	if rec.Current != "w1:p2" || rec.Previous != "w1:p1" {

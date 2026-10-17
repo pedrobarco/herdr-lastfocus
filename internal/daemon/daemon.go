@@ -489,6 +489,18 @@ func (r *recorder) pollCurrentPane() {
 	if _, err := r.store.Update(history.PaneFile(cp.TabID), cp.PaneID); err != nil {
 		log.Printf("update poll pane: %v", err)
 	}
+	// Keyboard tab and workspace switches fire no events either, so record
+	// them here. Update is a no-op when the id equals the stored current.
+	ws := workspaceOfTab(cp.TabID)
+	if ws == "" {
+		return
+	}
+	if _, err := r.store.Update(history.TabFile(ws), cp.TabID); err != nil {
+		log.Printf("update poll tab: %v", err)
+	}
+	if _, err := r.store.Update(history.WorkspaceFile(), ws); err != nil {
+		log.Printf("update poll workspace: %v", err)
+	}
 }
 
 // lookupTabForPane resolves a pane's tab id via a fresh snapshot connection.
